@@ -97,8 +97,10 @@ public class HelpPostsController : ControllerBase
     }
 
     [HttpGet("{id:guid}")]
-    public async Task<IActionResult> Details(Guid id)
+    public async Task<IActionResult> Details(Guid id, [FromServices] CurrentUserService current)
     {
+        var userId = current.UserId;
+
         var post = await _db.HelpPosts.AsNoTracking()
             .Where(p => p.Id == id)
             .Select(p => new
@@ -115,16 +117,71 @@ public class HelpPostsController : ControllerBase
                 p.StartsAt,
                 p.EndsAt,
                 p.NeededVolunteers,
+                p.Urgency,
+                p.HelpType,
+                p.ContactAfterAccept,
+                p.ContactTelegram,
+                p.ContactViber,
                 p.OrganizationId,
                 p.CreatedByUserId,
-                p.CreatedAt
+                CreatedByName = p.CreatedByUser.FullName,
+                p.CreatedAt,
+                AcceptedCount = _db.HelpPostApplications
+                    .Count(a => a.HelpPostId == p.Id && a.Status == ApplicationStatus.Accepted),
             })
             .FirstOrDefaultAsync();
 
         if (post == null)
             return NotFound(new { message = "Postarea nu a fost găsită" });
 
-        return Ok(post);
+        string? myApplicationStatus = null;
+        Guid? myApplicationId = null;
+        bool contactVisible = false;
+
+        if (userId != null)
+        {
+            var myApp = await _db.HelpPostApplications.AsNoTracking()
+                .Where(a => a.HelpPostId == id && a.ApplicantUserId == userId)
+                .Select(a => new { a.Id, Status = a.Status.ToString() })
+                .FirstOrDefaultAsync();
+
+            myApplicationStatus = myApp?.Status;
+            myApplicationId = myApp?.Id;
+
+            var isCreator = post.CreatedByUserId == userId;
+            var isAccepted = myApp?.Status == "Accepted";
+
+            contactVisible = isCreator || isAccepted;
+        }
+
+        return Ok(new
+        {
+            post.Id,
+            post.Type,
+            post.Status,
+            post.Category,
+            post.Title,
+            post.Description,
+            post.City,
+            post.Area,
+            post.AddressApprox,
+            post.StartsAt,
+            post.EndsAt,
+            post.NeededVolunteers,
+            post.AcceptedCount,
+            post.Urgency,
+            post.HelpType,
+            post.ContactAfterAccept,
+            post.OrganizationId,
+            post.CreatedByUserId,
+            post.CreatedByName,
+            post.CreatedAt,
+            ContactTelegram = contactVisible ? post.ContactTelegram : null,
+            ContactViber = contactVisible ? post.ContactViber : null,
+            MyApplicationStatus = myApplicationStatus,
+            MyApplicationId = myApplicationId,
+            IsMyPost = post.CreatedByUserId == userId,
+        });
     }
 
     [HttpPost("{id:guid}/apply")]
@@ -180,6 +237,57 @@ public class HelpPostsController : ControllerBase
         {
             await _service.CancelPost(id);
             return Ok(new { message = "Postarea a fost anulată" });
+        }
+        catch (Exception ex)
+        {
+            return BadRequest(new { message = ex.Message });
+        }
+    }
+
+    [HttpPatch("{id:guid}")]
+    public async Task<IActionResult> Update(Guid id, [FromBody] UpdateHelpPostRequest req,
+    [FromServices] CurrentUserService current)
+    {
+        try
+        {
+            var userId = current.UserId ?? throw new Exception("Neautentificat");
+
+            var post = await _db.HelpPosts.FirstOrDefaultAsync(p => p.Id == id);
+            if (post == null)
+                return NotFound(new { message = "Postarea nu a fost găsită" });
+
+            if (post.CreatedByUserId != userId)
+                return Forbid();
+
+            if (post.Status != HelpPostStatus.Pending)
+                throw new Exception("Poți edita doar cererile în așteptare");
+
+            // aplică doar câmpurile trimise
+            if (req.Title != null) post.Title = req.Title.Trim();
+            if (req.Description != null) post.Description = req.Description.Trim();
+            if (req.StartsAt != null) post.StartsAt = req.StartsAt.Value;
+            if (req.EndsAt != null) post.EndsAt = req.EndsAt.Value;
+            if (req.City != null) post.City = req.City.Trim();
+            if (req.Area != null) post.Area = req.Area.Trim();
+            if (req.AddressApprox != null) post.AddressApprox = req.AddressApprox.Trim();
+            if (req.NeededVolunteers != null) post.NeededVolunteers = req.NeededVolunteers.Value;
+            if (req.Urgency != null) post.Urgency = req.Urgency.Trim();
+            if (req.HelpType != null) post.HelpType = req.HelpType.Trim();
+            if (req.ContactTelegram != null) post.ContactTelegram = req.ContactTelegram.Trim();
+            if (req.ContactViber != null) post.ContactViber = req.ContactViber.Trim();
+            if (req.ContactAfterAccept != null) post.ContactAfterAccept = req.ContactAfterAccept.Value;
+
+            if (req.Category != null && Enum.TryParse<VolunteerCategory>(req.Category, true, out var cat))
+                post.Category = cat;
+
+            // re-verificare ore sigure
+            if (!IsWithinSafeHours(post.StartsAt, post.EndsAt))
+                post.Status = HelpPostStatus.NeedsReview;
+
+            post.UpdatedAt = DateTime.UtcNow;
+            await _db.SaveChangesAsync();
+
+            return Ok(new { message = "Cererea a fost actualizată", status = post.Status.ToString() });
         }
         catch (Exception ex)
         {
@@ -418,5 +526,21 @@ public class HelpPostsController : ControllerBase
             canCreate = myRole != OrgRole.Viewer,
             viewerMessage = myRole == OrgRole.Viewer ? "Nu poți crea cereri momentan." : null
         });
+    }
+
+    private static bool IsWithinSafeHours(DateTime startsAt, DateTime? endsAt = null)
+    {
+        var startHour = startsAt.Hour;
+        if (startHour < 6 || startHour >= 21)
+            return false;
+
+        if (endsAt.HasValue)
+        {
+            var endHour = endsAt.Value.Hour;
+            if (endHour < 6 || endHour > 21)
+                return false;
+        }
+
+        return true;
     }
 }

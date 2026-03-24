@@ -35,4 +35,10 @@ public class HelpPost
 
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
     public DateTime? UpdatedAt { get; set; }
+
+    public string Urgency { get; set; } = "Low";        
+    public string HelpType { get; set; } = "Individual"; 
+    public string? ContactTelegram { get; set; }
+    public string? ContactViber { get; set; }
+    public bool ContactAfterAccept { get; set; } = true;
 }

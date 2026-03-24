@@ -4,5 +4,5 @@ public enum UserRole
 {
     Volunteer = 0,
     ONG = 1,
-    Admin = 2
+    AdminPlatfrom = 2
 }

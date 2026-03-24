@@ -10,11 +10,16 @@ public class HelpPostsService
 {
     private readonly AppDbContext _db;
     private readonly CurrentUserService _current;
+    private readonly INotificationService _notifications;
+    private readonly IContentModerationService _moderation;
 
-    public HelpPostsService(AppDbContext db, CurrentUserService current)
+    public HelpPostsService(AppDbContext db, CurrentUserService current,
+        INotificationService notifications, IContentModerationService moderation)
     {
         _db = db;
         _current = current;
+        _notifications = notifications;
+        _moderation = moderation;
     }
 
     private static bool IsWithinSafeHours(DateTime startsAt)
@@ -27,7 +32,6 @@ public class HelpPostsService
     {
         var userId = _current.UserId ?? throw new Exception("Neautentificat");
 
-        // basic validations
         if (string.IsNullOrWhiteSpace(req.Title))
             throw new Exception("Titlul este obligatoriu");
 
@@ -46,14 +50,12 @@ public class HelpPostsService
         if (!Enum.TryParse<VolunteerCategory>(req.Category, true, out var cat))
             cat = VolunteerCategory.Other;
 
-        // interval validations
         if (req.EndsAt <= req.StartsAt)
             throw new Exception("Interval invalid");
 
         if (req.NeededVolunteers < 1 || req.NeededVolunteers > 50)
             throw new Exception("Numărul de persoane necesare este invalid");
 
-        // daca postezi pe organizatie trebuie sa fii membru activ
         if (req.OrganizationId.HasValue)
         {
             var orgId = req.OrganizationId.Value;
@@ -70,40 +72,33 @@ public class HelpPostsService
                 throw new Exception("Nu ai permisiunea să creezi cereri pentru această organizație");
         }
 
-        // safety rule 
-        var needsReview = false;
-        string? reason = null;
+        var modReport = _moderation.Evaluate(req.Title, req.Description, req.StartsAt);
 
-        if (!IsWithinSafeHours(req.StartsAt))
-        {
-            needsReview = true;
-            reason = "Ora selectată este în afara intervalului permis (06:00–21:00).";
-        }
+        if (modReport.Result == ModerationResult.Blocked)
+            throw new Exception(modReport.Reason ?? "Conținutul nu poate fi publicat.");
 
-        // detector termeni interziși 
+        var needsReview = modReport.Result == ModerationResult.NeedsReview;
+        var reason = modReport.Reason;
 
-        // create
         var post = new HelpPost
         {
             Type = type,
             Category = cat,
-
             Title = req.Title.Trim(),
             Description = req.Description.Trim(),
-
             StartsAt = req.StartsAt,
             EndsAt = req.EndsAt,
-
             City = req.City.Trim(),
-            Area = req.Area.Trim(),
-
+            Area = req.Area?.Trim() ?? string.Empty,
             AddressApprox = string.IsNullOrWhiteSpace(req.AddressApprox) ? null : req.AddressApprox.Trim(),
-
             NeededVolunteers = req.NeededVolunteers,
-
             CreatedByUserId = userId,
             OrganizationId = req.OrganizationId,
-
+            Urgency = req.Urgency ?? "Low",
+            HelpType = req.HelpType ?? "Individual",
+            ContactTelegram = string.IsNullOrWhiteSpace(req.ContactTelegram) ? null : req.ContactTelegram.Trim(),
+            ContactViber = string.IsNullOrWhiteSpace(req.ContactViber) ? null : req.ContactViber.Trim(),
+            ContactAfterAccept = req.ContactAfterAccept,
             Status = needsReview ? HelpPostStatus.NeedsReview : HelpPostStatus.Pending,
             NeedsReviewReason = reason,
             CreatedAt = DateTime.UtcNow
@@ -146,10 +141,8 @@ public class HelpPostsService
             HelpPostId = postId,
             ApplicantUserId = userId,
             ApplicantOrganizationId = req.ApplicantOrganizationId,
-
             Message = string.IsNullOrWhiteSpace(req.Message) ? null : req.Message.Trim(),
             AvailabilityNote = string.IsNullOrWhiteSpace(req.AvailabilityNote) ? null : req.AvailabilityNote.Trim(),
-
             Status = ApplicationStatus.Pending,
             RejectReason = ApplicationRejectReason.None,
             CreatedAt = DateTime.UtcNow
@@ -157,6 +150,17 @@ public class HelpPostsService
 
         _db.HelpPostApplications.Add(app);
         await _db.SaveChangesAsync();
+
+        var applicantName = await _db.Users
+            .Where(u => u.Id == userId)
+            .Select(u => u.FullName)
+            .FirstOrDefaultAsync() ?? "Un utilizator";
+
+        await _notifications.NotifyNewApplicationAsync(
+            postOwnerId: post.CreatedByUserId,
+            applicantName: applicantName,
+            postTitle: post.Title,
+            requestId: post.Id);
 
         return app;
     }
@@ -170,7 +174,6 @@ public class HelpPostsService
 
         if (app == null) throw new Exception("Nu există aplicație de retras");
 
-        // stergem assignment
         if (app.Status == ApplicationStatus.Accepted)
         {
             var assignment = await _db.HelpPostAssignments.FirstOrDefaultAsync(x => x.ApplicationId == app.Id);
@@ -183,8 +186,8 @@ public class HelpPostsService
 
         await _db.SaveChangesAsync();
 
-        // dupa withdraw recalculam status post
         var post = await _db.HelpPosts.FirstAsync(p => p.Id == postId);
+
         if (post.Status == HelpPostStatus.InProgress)
         {
             var acceptedCount = await _db.HelpPostApplications
@@ -198,6 +201,17 @@ public class HelpPostsService
                 await _db.SaveChangesAsync();
             }
         }
+
+        var applicantName = await _db.Users
+            .Where(u => u.Id == userId)
+            .Select(u => u.FullName)
+            .FirstOrDefaultAsync() ?? "Un utilizator";
+
+        await _notifications.NotifyApplicationWithdrawnAsync(
+            postOwnerId: post.CreatedByUserId,
+            applicantName: applicantName,
+            postTitle: post.Title,
+            requestId: post.Id);
     }
 
     public async Task AcceptApplication(Guid postId, Guid applicationId)
@@ -219,7 +233,6 @@ public class HelpPostsService
         if (app.Status == ApplicationStatus.Withdrawn)
             throw new Exception("Aplicația a fost retrasă");
 
-        // verificare nr acceptati
         var acceptedCount = await _db.HelpPostApplications
             .Where(a => a.HelpPostId == postId && a.Status == ApplicationStatus.Accepted)
             .CountAsync();
@@ -230,7 +243,6 @@ public class HelpPostsService
         app.Status = ApplicationStatus.Accepted;
         app.RejectReason = ApplicationRejectReason.None;
         app.UpdatedAt = DateTime.UtcNow;
-
 
         var alreadyAssigned = await _db.HelpPostAssignments.AnyAsync(x => x.ApplicationId == app.Id);
         if (!alreadyAssigned)
@@ -244,7 +256,7 @@ public class HelpPostsService
 
         await _db.SaveChangesAsync();
 
-        // dupa accept daca s-a ajuns la quota se resping restul pending ca CapacityFilled 
+        // respinge restul dacă s-a umplut cota
         acceptedCount = await _db.HelpPostApplications
             .Where(a => a.HelpPostId == postId && a.Status == ApplicationStatus.Accepted)
             .CountAsync();
@@ -263,11 +275,20 @@ public class HelpPostsService
             }
         }
 
-        // status post
         post.Status = HelpPostStatus.InProgress;
         post.UpdatedAt = DateTime.UtcNow;
 
         await _db.SaveChangesAsync();
+
+        await _notifications.NotifyApplicationAcceptedAsync(
+            applicantId: app.ApplicantUserId,
+            postTitle: post.Title,
+            applicationId: app.Id);
+
+        await _notifications.NotifyRequestInProgressAsync(
+            postOwnerId: post.CreatedByUserId,
+            postTitle: post.Title,
+            requestId: post.Id);
     }
 
     public async Task CancelPost(Guid postId)
@@ -389,17 +410,14 @@ public class HelpPostsService
         if (app.Status != ApplicationStatus.Accepted)
             throw new Exception("Poți lăsa feedback doar pentru aplicații acceptate");
 
-        // cine are voie să trimită feedback
         var isCreator = post.CreatedByUserId == fromUserId;
         var isVolunteer = app.ApplicantUserId == fromUserId;
 
         if (!isCreator && !isVolunteer)
             throw new Exception("Nu ai permisiunea să trimiți feedback pentru această activitate");
 
-        // catre cine e feedback-ul
         var toUserId = isCreator ? app.ApplicantUserId : post.CreatedByUserId;
 
-        // prevenire duplicate
         var exists = await _db.HelpPostFeedbacks.AnyAsync(f =>
             f.HelpPostId == postId &&
             f.ApplicationId == app.Id &&
@@ -408,6 +426,8 @@ public class HelpPostsService
 
         if (exists)
             throw new Exception("Ai trimis deja feedback pentru această aplicație");
+
+        var avgRating = (req.Safety + req.Communication + req.Reliability) / 3;
 
         _db.HelpPostFeedbacks.Add(new HelpPostFeedback
         {
@@ -422,6 +442,12 @@ public class HelpPostsService
         });
 
         await _db.SaveChangesAsync();
+
+        await _notifications.NotifyFeedbackReceivedAsync(
+            userId: toUserId,
+            stars: avgRating,
+            postTitle: post.Title,
+            requestId: post.Id);
     }
 
     public async Task<object> FeedbackRequired(Guid postId)
@@ -431,7 +457,6 @@ public class HelpPostsService
         var post = await _db.HelpPosts.AsNoTracking().FirstOrDefaultAsync(p => p.Id == postId);
         if (post == null) throw new Exception("Postarea nu a fost găsită");
 
-        // doar creatorul sau voluntarii acceptați pot vedea
         var acceptedApps = await _db.HelpPostApplications.AsNoTracking()
             .Where(a => a.HelpPostId == postId && a.Status == ApplicationStatus.Accepted)
             .Select(a => new { a.Id, a.ApplicantUserId })
@@ -442,8 +467,7 @@ public class HelpPostsService
 
         if (!isCreator && !isAcceptedVolunteer)
             throw new Exception("Nu ai acces la această informație");
-        
-        // pentru fiecare aplicație acceptată, trebuie 2 feedback-uri
+
         var required = new List<object>();
 
         foreach (var a in acceptedApps)
@@ -506,6 +530,20 @@ public class HelpPostsService
         post.Status = HelpPostStatus.Completed;
         post.UpdatedAt = DateTime.UtcNow;
         await _db.SaveChangesAsync();
-    }
 
+        // creatorul
+        await _notifications.NotifyRequestCompletedAsync(
+            userId: post.CreatedByUserId,
+            postTitle: post.Title,
+            requestId: post.Id);
+
+        // fiecare voluntar acceptat
+        foreach (var a in acceptedApps)
+        {
+            await _notifications.NotifyRequestCompletedAsync(
+                userId: a.ApplicantUserId,
+                postTitle: post.Title,
+                requestId: post.Id);
+        }
+    }
 }

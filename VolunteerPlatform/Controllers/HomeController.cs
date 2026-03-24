@@ -23,123 +23,178 @@ public class HomeController : ControllerBase
     }
 
     [HttpGet]
-    public async Task<IActionResult> GetHome([FromQuery] Guid? orgId = null)
+    public async Task<IActionResult> GetHome()
     {
         var userId = _current.UserId ?? throw new Exception("Neautentificat");
 
-        // cererile/postarile create de mine
-        var myCreated = await _db.HelpPosts.AsNoTracking()
+        var user = await _db.Users
+            .AsNoTracking()
+            .FirstOrDefaultAsync(u => u.Id == userId);
+
+        if (user == null)
+            return Unauthorized(new { message = "Utilizatorul nu a fost găsit" });
+
+        var createdActivities = await _db.HelpPosts
+            .AsNoTracking()
             .Where(p => p.CreatedByUserId == userId)
-            .OrderByDescending(p => p.CreatedAt)
-            .Take(5)
-            .Select(p => new HomeCardItem
+            .Select(p => new HomeActivity
             {
                 Id = p.Id,
-                Type = p.Type.ToString(),
+                Kind = "created_post",
+                Title = p.Type == HelpPostType.Request
+                    ? $"Ai o cerere activă: {p.Title}"
+                    : $"Ai o ofertă activă: {p.Title}",
+                Meta = $"{p.StartsAt:dd.MM.yyyy} • {p.StartsAt:HH:mm} - {p.EndsAt:HH:mm} • {p.City}",
+                ActionText = "Detalii",
                 Status = p.Status.ToString(),
-                Title = p.Title,
-                StartsAt = p.StartsAt,
-                City = p.City,
-                Area = p.Area
+                SortDate = p.CreatedAt
             })
             .ToListAsync();
 
-        // cererile la care am aplicat
-        var myApplied = await _db.HelpPostApplications.AsNoTracking()
+        var appliedActivities = await _db.HelpPostApplications
+            .AsNoTracking()
+            .Include(a => a.HelpPost)
             .Where(a => a.ApplicantUserId == userId)
-            .OrderByDescending(a => a.CreatedAt)
-            .Take(5)
-            .Select(a => new HomeCardItem
+            .Select(a => new HomeActivity
             {
                 Id = a.HelpPostId,
-                Type = a.HelpPost.Type.ToString(),
-                Status = a.HelpPost.Status.ToString(),
-                Title = a.HelpPost.Title,
-                StartsAt = a.HelpPost.StartsAt,
-                City = a.HelpPost.City,
-                Area = a.HelpPost.Area
+                Kind = a.Status == ApplicationStatus.Accepted
+                    ? "application_accepted"
+                    : "application_pending",
+                Title = a.Status == ApplicationStatus.Accepted
+                    ? $"Ai fost acceptat(ă): {a.HelpPost.Title}"
+                    : $"Ai aplicat: {a.HelpPost.Title}",
+                Meta = $"{a.HelpPost.StartsAt:dd.MM.yyyy} • {a.HelpPost.StartsAt:HH:mm} - {a.HelpPost.EndsAt:HH:mm} • {a.HelpPost.City}",
+                ActionText = "Detalii",
+                Status = a.Status.ToString(),
+                SortDate = a.CreatedAt
             })
             .ToListAsync();
 
-        // recomandate matching
-        var myCity = myCreated.FirstOrDefault()?.City ?? myApplied.FirstOrDefault()?.City;
+        var currentActivities = createdActivities
+            .Concat(appliedActivities)
+            .OrderByDescending(x => x.SortDate)
+            .Take(3)
+            .ToList();
 
-        var recQ = _db.HelpPosts.AsNoTracking()
-            .Where(p => p.Status == HelpPostStatus.Pending);
+        var preferredCategories = await _db.UserCategoryPreferences
+            .AsNoTracking()
+            .Where(x => x.UserId == userId)
+            .Select(x => x.Category)
+            .ToListAsync();
 
-        if (!string.IsNullOrWhiteSpace(myCity))
+        var recommendedBaseQuery = _db.HelpPosts
+            .AsNoTracking()
+            .Include(p => p.Organization)
+            .Where(p =>
+                p.CreatedByUserId != userId &&
+                p.Status == HelpPostStatus.Pending);
+
+        if (!string.IsNullOrWhiteSpace(user.City))
         {
-            var c = myCity.Trim().ToLowerInvariant();
-            recQ = recQ.Where(p => p.City.ToLower() == c);
+            var city = user.City.Trim().ToLowerInvariant();
+            recommendedBaseQuery = recommendedBaseQuery.Where(p => p.City.ToLower() == city);
         }
 
-        var recommended = await recQ
+        if (preferredCategories.Count > 0)
+        {
+            recommendedBaseQuery = recommendedBaseQuery.Where(p => preferredCategories.Contains(p.Category));
+        }
+
+        var recommendedActivities = await recommendedBaseQuery
             .OrderByDescending(p => p.CreatedAt)
-            .Take(10)
-            .Select(p => new HomeCardItem
+            .Take(2)
+            .Select(p => new HomeRecommendation
             {
                 Id = p.Id,
-                Type = p.Type.ToString(),
-                Status = p.Status.ToString(),
                 Title = p.Title,
-                StartsAt = p.StartsAt,
-                City = p.City,
-                Area = p.Area
+                OrganizationName = p.Organization != null ? p.Organization.Name : "Organizație",
+                Meta = $"{p.StartsAt:dd.MM.yyyy} • {p.StartsAt:HH:mm} - {p.EndsAt:HH:mm} • {p.City}",
+                Category = (int)p.Category
             })
             .ToListAsync();
 
-        object? orgSection = null;
+        var quickCategories = preferredCategories
+            .Select(x => (int)x)
+            .Distinct()
+            .ToList();
 
-        // organizația mea
-        if (orgId.HasValue)
+        if (quickCategories.Count == 0)
+            quickCategories = new List<int> { 0, 1, 2, 3, 4, 99 };
+
+        var now = DateTime.UtcNow;
+
+        var currentMonthAssignments = await _db.HelpPostAssignments
+            .AsNoTracking()
+            .Include(x => x.HelpPost)
+            .Include(x => x.Application)
+            .Where(x =>
+                x.Application.ApplicantUserId == userId &&
+                x.HelpPost.Status == HelpPostStatus.Completed &&
+                x.HelpPost.StartsAt.Year == now.Year &&
+                x.HelpPost.StartsAt.Month == now.Month)
+            .ToListAsync();
+
+        var currentMonthHours = (int)Math.Round(
+            currentMonthAssignments.Sum(x =>
+                Math.Max(0, (x.HelpPost.EndsAt - x.HelpPost.StartsAt).TotalHours))
+        );
+
+        var currentMonthVolunteerCount = currentMonthAssignments.Count;
+
+        var allCompletedAssignments = await _db.HelpPostAssignments
+            .AsNoTracking()
+            .Include(x => x.HelpPost)
+            .Include(x => x.Application)
+            .Where(x =>
+                x.Application.ApplicantUserId == userId &&
+                x.HelpPost.Status == HelpPostStatus.Completed)
+            .ToListAsync();
+
+        var totalHours = (int)Math.Round(
+            allCompletedAssignments.Sum(x =>
+                Math.Max(0, (x.HelpPost.EndsAt - x.HelpPost.StartsAt).TotalHours))
+        );
+
+        var volunteerCount = allCompletedAssignments.Count;
+
+        var response = new HomeDashboard
         {
-            var myRole = await _db.OrganizationMembers.AsNoTracking()
-                .Where(m => m.OrganizationId == orgId.Value && m.UserId == userId && m.IsActive)
-                .Select(m => (OrgRole?)m.Role)
-                .FirstOrDefaultAsync();
-
-            if (myRole == null)
-                return Forbid();
-
-            var orgPosts = await _db.HelpPosts.AsNoTracking()
-                .Where(p => p.OrganizationId == orgId.Value)
-                .OrderByDescending(p => p.CreatedAt)
-                .Take(10)
-                .Select(p => new HomeCardItem
-                {
-                    Id = p.Id,
-                    Type = p.Type.ToString(),
-                    Status = p.Status.ToString(),
-                    Title = p.Title,
-                    StartsAt = p.StartsAt,
-                    City = p.City,
-                    Area = p.Area
-                })
-                .ToListAsync();
-
-            orgSection = new
+            Header = new HomeHeader
             {
-                orgId = orgId.Value,
-                myRole = myRole.ToString(),
-                canCreate = myRole != OrgRole.Viewer,
-                viewerMessage = myRole == OrgRole.Viewer ? "Nu poți crea cereri momentan" : null,
-                orgPosts,
-                orgEmptyMessage = orgPosts.Count == 0 ? "Organizația nu are postări momentan" : null
-            };
-        }
+                FullName = user.FullName,
+                FirstName = GetFirstName(user.FullName),
+                Level = CalculateLevel(totalHours),
+                TotalHours = totalHours,
+                VolunteerCount = volunteerCount,
+                AvatarUrl = user.AvatarUrl,  
+            },
+            CurrentActivities = currentActivities,
+            RecommendedActivities = recommendedActivities,
+            QuickCategories = quickCategories.Take(6).ToList(),
+            Impact = new HomeImpact
+            {
+                CurrentMonthHours = currentMonthHours,
+                CurrentMonthVolunteerCount = currentMonthVolunteerCount
+            }
+        };
 
-        return Ok(new
-        {
-            myCreated,
-            myCreatedEmptyMessage = myCreated.Count == 0 ? "Nu ai creat încă nimic" : null,
+        return Ok(response);
+    }
 
-            myApplied,
-            myAppliedEmptyMessage = myApplied.Count == 0 ? "Nu ai aplicat încă la nimic." : null,
+    private static string GetFirstName(string fullName)
+    {
+        if (string.IsNullOrWhiteSpace(fullName))
+            return "utilizator";
+        return fullName.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault()
+               ?? "utilizator";
+    }
 
-            recommended,
-            recommendedEmptyMessage = recommended.Count == 0 ? "Nu sunt recomandări momentan" : null,
-
-            orgSection
-        });
+    private static string CalculateLevel(int totalHours)
+    {
+        if (totalHours >= 120) return "Lider voluntar";
+        if (totalHours >= 60) return "Implicat";
+        if (totalHours >= 30) return "Activ";
+        return "Începător";
     }
 }

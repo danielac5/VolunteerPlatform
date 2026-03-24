@@ -19,4 +19,12 @@ public class RegisterRequest
     [Required, RegularExpression(@"^(?=.*[A-Z])(?=.*\d).{8,}$",
         ErrorMessage = "Parola nu bifează toate cerințele de securitate")]
     public string Password { get; set; } = string.Empty;
+
+    [StringLength(100)]
+    public string? City { get; set; }
+
+    [StringLength(100)]
+    public string? Area { get; set; }
+
+    public List<int> PreferredCategories { get; set; } = new();
 }

@@ -14,8 +14,8 @@ public class AuthService
     private readonly EmailVerificationService _emailVerification;
 
     public AuthService(
-        AppDbContext db, 
-        PasswordHasher hasher, 
+        AppDbContext db,
+        PasswordHasher hasher,
         JwtTokenService jwt,
         EmailVerificationService emailVerification)
     {
@@ -27,19 +27,16 @@ public class AuthService
 
     public async Task<AuthResponse> Register(RegisterRequest request)
     {
-        // Normalize
         var email = request.Email.Trim().ToLowerInvariant();
         var fullName = request.FullName.Trim();
         var phone = "+373" + request.PhoneDigits.Trim();
 
-        // Uniqueness checks
         if (await _db.Users.AnyAsync(u => u.Email == email))
             throw new Exception("Email already exists");
 
         if (await _db.Users.AnyAsync(u => u.PhoneNumber == phone))
             throw new Exception("Phone number already exists");
 
-        // Calculate minor
         var today = DateOnly.FromDateTime(DateTime.UtcNow);
         var age = today.Year - request.DateOfBirth.Year;
         if (request.DateOfBirth > today.AddYears(-age)) age--;
@@ -55,9 +52,29 @@ public class AuthService
             PasswordHash = _hasher.Hash(request.Password),
             Role = UserRole.Volunteer,
             EmailConfirmed = false,
+            City = string.IsNullOrWhiteSpace(request.City) ? null : request.City.Trim(),
+            Area = string.IsNullOrWhiteSpace(request.Area) ? null : request.Area.Trim()
         };
 
         _db.Users.Add(user);
+
+        var distinctCategories = request.PreferredCategories
+            .Distinct()
+            .Take(2)
+            .ToList();
+
+        foreach (var categoryValue in distinctCategories)
+        {
+            if (!Enum.IsDefined(typeof(VolunteerCategory), categoryValue))
+                continue;
+
+            _db.UserCategoryPreferences.Add(new UserCategoryPreference
+            {
+                UserId = user.Id,
+                Category = (VolunteerCategory)categoryValue
+            });
+        }
+
         await _db.SaveChangesAsync();
         await _emailVerification.GenerateCode(user, VerificationPurpose.EmailConfirmation);
 

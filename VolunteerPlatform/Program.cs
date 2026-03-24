@@ -4,6 +4,7 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
 using System.Text;
 using VolunteerPlatform.Data;
+using VolunteerPlatform.Domain.Entities;
 using VolunteerPlatform.Services;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -85,7 +86,31 @@ builder.Services.AddSwaggerGen(options =>
 
 builder.Services.AddHttpContextAccessor();
 builder.Services.AddScoped<CurrentUserService>();
+builder.Services.AddScoped<IHomeService, HomeService>();
 builder.Services.AddScoped<HelpPostsService>();
+builder.Services.AddScoped<INotificationService, NotificationService>();
+builder.Services.AddSingleton<IContentModerationService, ContentModerationService>();
+builder.Services.AddScoped<ISupportService, SupportService>();
+
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy("AllowFlutterWebDev", policy =>
+    {
+        policy
+            .SetIsOriginAllowed(origin =>
+            {
+                if (string.IsNullOrWhiteSpace(origin))
+                    return false;
+
+                var uri = new Uri(origin);
+
+                return uri.Host == "localhost" || uri.Host == "127.0.0.1";
+            })
+            .AllowAnyHeader()
+            .AllowAnyMethod();
+    });
+});
+
 
 var app = builder.Build();
 
@@ -98,8 +123,12 @@ if (app.Environment.IsDevelopment())
 
 app.UseHttpsRedirection();
 
+app.UseCors("AllowFlutterWebDev");
+
 app.UseAuthentication();
 app.UseAuthorization();
+
+app.UseStaticFiles();
 
 app.MapControllers();
 
